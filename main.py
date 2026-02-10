@@ -282,7 +282,7 @@ class HapiConnectorPlugin(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @hapi.command("perm")
-    async def cmd_perm(self, event: AstrMessageEvent):
+    async def cmd_perm(self, event: AstrMessageEvent, mode: str = ""):
         """查看/切换权限模式: /hapi perm [模式名]"""
         sid = self._current_sid(event)
         if not sid:
@@ -292,15 +292,14 @@ class HapiConnectorPlugin(Star):
         flavor = self._current_flavor(event) or "claude"
         modes = PERMISSION_MODES.get(flavor, ["default"])
 
-        raw = event.message_str.strip()
-        if raw:
-            mode = raw
-            if raw.isdigit() and 1 <= int(raw) <= len(modes):
-                mode = modes[int(raw) - 1]
-            if mode not in modes:
+        if mode:
+            target = mode
+            if mode.isdigit() and 1 <= int(mode) <= len(modes):
+                target = modes[int(mode) - 1]
+            if target not in modes:
                 yield event.plain_result(f"无效模式，可用: {', '.join(modes)}")
                 return
-            ok, msg = await session_ops.set_permission_mode(self.client, sid, mode)
+            ok, msg = await session_ops.set_permission_mode(self.client, sid, target)
             yield event.plain_result(msg)
         else:
             detail = await session_ops.fetch_session_detail(self.client, sid)
@@ -312,7 +311,7 @@ class HapiConnectorPlugin(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @hapi.command("model")
-    async def cmd_model(self, event: AstrMessageEvent):
+    async def cmd_model(self, event: AstrMessageEvent, mode: str = ""):
         """查看/切换模型: /hapi model [模式名]"""
         sid = self._current_sid(event)
         if not sid:
@@ -324,15 +323,14 @@ class HapiConnectorPlugin(Star):
             yield event.plain_result("模型切换仅支持 Claude session")
             return
 
-        raw = event.message_str.strip()
-        if raw:
-            mode = raw
-            if raw.isdigit() and 1 <= int(raw) <= len(MODEL_MODES):
-                mode = MODEL_MODES[int(raw) - 1]
-            if mode not in MODEL_MODES:
+        if mode:
+            target = mode
+            if mode.isdigit() and 1 <= int(mode) <= len(MODEL_MODES):
+                target = MODEL_MODES[int(mode) - 1]
+            if target not in MODEL_MODES:
                 yield event.plain_result(f"无效模式，可用: {', '.join(MODEL_MODES)}")
                 return
-            ok, msg = await session_ops.set_model_mode(self.client, sid, mode)
+            ok, msg = await session_ops.set_model_mode(self.client, sid, target)
             yield event.plain_result(msg)
         else:
             detail = await session_ops.fetch_session_detail(self.client, sid)
@@ -342,34 +340,41 @@ class HapiConnectorPlugin(Star):
 
     # ── output ──
 
-    _OUTPUT_LEVELS = ["silence", "summary", "debug"]
+    _OUTPUT_LEVELS = {
+        "silence": "仅推送权限请求和任务完成提醒",
+        "summary": "AI 思考完成后推送最近消息摘要",
+        "debug": "实时推送所有新消息（信息量较大）",
+    }
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @hapi.command("output", alias={"out"})
-    async def cmd_output(self, event: AstrMessageEvent):
+    async def cmd_output(self, event: AstrMessageEvent, level: str = ""):
         """查看/切换 SSE 推送级别: /hapi output [级别]"""
-        raw = event.message_str.strip()
         current = self.sse_listener.output_level
+        levels = list(self._OUTPUT_LEVELS.keys())
 
-        if not raw:
+        if not level:
             lines = [f"当前 SSE 推送级别: {current}"]
-            for i, lvl in enumerate(self._OUTPUT_LEVELS, 1):
+            for i, (lvl, desc) in enumerate(self._OUTPUT_LEVELS.items(), 1):
                 tag = " <--" if lvl == current else ""
-                lines.append(f"  [{i}] {lvl}{tag}")
+                lines.append(f"  [{i}] {lvl}{tag} — {desc}")
             lines.append("\n回复序号或级别名切换")
             yield event.plain_result("\n".join(lines))
             return
 
-        level = raw
-        if raw.isdigit() and 1 <= int(raw) <= len(self._OUTPUT_LEVELS):
-            level = self._OUTPUT_LEVELS[int(raw) - 1]
-        if level not in self._OUTPUT_LEVELS:
-            yield event.plain_result(
-                f"无效级别，可用: {', '.join(self._OUTPUT_LEVELS)}")
+        target = level
+        if level.isdigit() and 1 <= int(level) <= len(levels):
+            target = levels[int(level) - 1]
+        if target not in self._OUTPUT_LEVELS:
+            lines = ["无效级别，可用:"]
+            for i, (lvl, desc) in enumerate(self._OUTPUT_LEVELS.items(), 1):
+                lines.append(f"  [{i}] {lvl} — {desc}")
+            yield event.plain_result("\n".join(lines))
             return
 
-        self.sse_listener.output_level = level
-        yield event.plain_result(f"SSE 推送级别已切换为: {level}")
+        self.sse_listener.output_level = target
+        yield event.plain_result(
+            f"SSE 推送级别已切换为: {target}\n{self._OUTPUT_LEVELS[target]}")
 
     # ── pending (查看待审批列表) ──
 
