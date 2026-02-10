@@ -66,7 +66,9 @@ class AsyncTokenManager:
         logger.info("正在获取 JWT ...")
         connector = _build_connector(self._proxy_url)
         try:
-            async with aiohttp.ClientSession(connector=connector) as session:
+            async with aiohttp.ClientSession(
+                connector=connector, connector_owner=True
+            ) as session:
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
@@ -74,7 +76,7 @@ class AsyncTokenManager:
                     self._obtained_at = time.time()
                     logger.info("JWT 获取成功，有效期 %ds", self._jwt_lifetime)
         except Exception:
-            connector.close()
+            await connector.close()
             raise
 
 
@@ -99,7 +101,9 @@ class AsyncHapiClient:
         """初始化 aiohttp.ClientSession"""
         if self._session is None or self._session.closed:
             connector = _build_connector(self._proxy_url)
-            self._session = aiohttp.ClientSession(connector=connector)
+            self._session = aiohttp.ClientSession(
+                connector=connector, connector_owner=True
+            )
 
     async def close(self):
         """关闭 aiohttp.ClientSession"""

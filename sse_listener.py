@@ -28,6 +28,8 @@ class SSEListener:
     def start(self, output_level: str = "summary"):
         """启动 SSE 监听任务"""
         self.output_level = output_level
+        self._debounce_sids: set[str] = set()
+        self._debounce_task: asyncio.Task | None = None
         self._task = asyncio.create_task(self._listen_loop())
 
     async def stop(self):
@@ -50,11 +52,15 @@ class SSEListener:
         max_backoff = 60
 
         while True:
+            resp = None
             try:
                 resp = await self.client.subscribe_events_raw(all_events=True)
                 backoff = 1  # 连接成功，重置退避
 
-                async for line_bytes in resp.content:
+                while True:
+                    line_bytes = await resp.content.readline()
+                    if not line_bytes:
+                        break  # 连接关闭
                     line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
                     if not line or not line.startswith("data: "):
                         continue
@@ -71,6 +77,9 @@ class SSEListener:
                 logger.warning("SSE 断线: %s, %ds 后重连", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
+            finally:
+                if resp is not None:
+                    resp.close()
 
     async def _handle(self, evt: dict):
         """处理单个 SSE 事件"""
@@ -136,10 +145,12 @@ class SSEListener:
 
         # === 输出级别处理 ===
 
-        # debug 模式：active 的 session 有事件就检查新消息
+        # debug 模式：防抖，合并短时间内的事件一次性拉取
         if self.output_level == "debug" and old_seq >= 0:
             if is_active or is_thinking:
-                await self._show_new_messages(sid, old_seq)
+                self._debounce_sids.add(sid)
+                if self._debounce_task is None or self._debounce_task.done():
+                    self._debounce_task = asyncio.create_task(self._debounced_fetch())
 
         # summary 模式：在 thinking 结束时显示摘要
         elif self.output_level == "summary":
@@ -180,6 +191,17 @@ class SSEListener:
                 if "pendingRequestsCount" in updated_data:
                     s["pendingRequestsCount"] = updated_data["pendingRequestsCount"]
                 break
+
+    async def _debounced_fetch(self):
+        """等一小段时间再拉取，合并密集的 SSE 事件"""
+        await asyncio.sleep(0.5)
+        sids = list(self._debounce_sids)
+        self._debounce_sids.clear()
+        for sid in sids:
+            async with self._lock:
+                old_seq = self.session_states.get(sid, {}).get("lastSeq", -1)
+            if old_seq >= 0:
+                await self._show_new_messages(sid, old_seq)
 
     async def _show_new_messages(self, sid: str, old_seq: int):
         """debug 模式：获取并显示所有新消息"""
