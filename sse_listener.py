@@ -255,19 +255,25 @@ class SSEListener:
             logger.warning("debug 模式获取消息异常: %s", e)
 
     async def _show_simple(self, sid: str):
-        """simple 模式：显示最近的 agent 纯文本消息（不含工具调用等）"""
+        """simple 模式：显示最后一条 user 消息之后的所有 agent 纯文本消息"""
         try:
-            msg_count = getattr(self.plugin, '_simple_msg_count', 5)
-            # 多取一些以确保过滤后够数
             messages = await session_ops.fetch_messages(self.client, sid, limit=50)
             if not messages:
                 return
 
-            # 筛选: agent 角色、有文本内容、不以 [ 开头（排除工具调用/返回等）
+            # 找到最后一条 user 消息的 seq，只取其后的 agent 消息
+            last_user_seq = 0
+            for msg in messages:
+                if msg.get("content", {}).get("role") == "user":
+                    last_user_seq = max(last_user_seq, msg.get("seq", 0))
+
+            # 筛选: seq > last_user_seq、agent 角色、有文本内容、不以 [ 开头（排除工具调用/返回等）
             agent_texts = []
             for msg in messages:
                 content = msg.get("content", {})
                 if content.get("role") != "agent":
+                    continue
+                if msg.get("seq", 0) <= last_user_seq:
                     continue
                 text = extract_text_preview(content, max_len=0)
                 if text is None or text.startswith("["):
@@ -276,9 +282,6 @@ class SSEListener:
 
             if not agent_texts:
                 return
-
-            # 取最后 N 条
-            agent_texts = agent_texts[-msg_count:]
 
             label = session_label_short(sid, self.plugin.sessions_cache)
             lines = [f"━━━ {label} ━━━"]
