@@ -1,0 +1,45 @@
+{
+  "hapi_endpoint": {
+    "description": "HAPI 服务地址",
+    "type": "string",
+    "default": "",
+    "hint": "例如: http://10.200.11.13:3006"
+  },
+  "access_token": {
+    "description": "HAPI Access Token (支持 token:namespace 格式)",
+    "type": "string",
+    "default": ""
+  },
+  "proxy_url": {
+    "description": "代理地址 (支持 socks5h:// 和 http://)",
+    "type": "string",
+    "default": "",
+    "hint": "例如: socks5h://127.0.0.1:1080 或 http://127.0.0.1:7890"
+  },
+  "jwt_lifetime": {
+    "description": "JWT 有效期 (秒)",
+    "type": "int",
+    "default": 900
+  },
+  "refresh_before_expiry": {
+    "description": "JWT 提前刷新时间 (秒)",
+    "type": "int",
+    "default": 180
+  },
+  "output_level": {
+    "description": "SSE 推送级别",
+    "type": "string",
+    "default": "silence",
+    "options": ["silence", "summary", "debug"]
+  },
+  "quick_prefix": {
+    "description": "快捷发送前缀",
+    "type": "string",
+    "default": ">"
+  },
+  "poke_approve": {
+    "description": "戳一戳自动全部审批 (仅 QQ NapCat 可用)",
+    "type": "bool",
+    "default": false
+  }
+}

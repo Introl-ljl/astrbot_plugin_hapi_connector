@@ -1,0 +1,260 @@
+"""后台 SSE 事件监听 + 推送通知"""
+
+import json
+import asyncio
+import logging
+
+from astrbot.api.event import MessageChain
+
+from .hapi_client import AsyncHapiClient
+from .formatters import extract_text_preview, session_label_short
+from . import session_ops
+
+logger = logging.getLogger(__name__)
+
+
+class SSEListener:
+    """后台 SSE 监听，实时捕获权限请求、等待输入、任务完成等事件"""
+
+    def __init__(self, client: AsyncHapiClient, plugin):
+        self.client = client
+        self.plugin = plugin  # 反向引用插件实例
+        self.output_level: str = "summary"
+        # {session_id: {request_id: {tool, arguments, ...}}}
+        self.pending: dict[str, dict] = {}
+        # 跟踪 session 状态以检测变化
+        self.session_states: dict[str, dict] = {}
+        self._lock = asyncio.Lock()
+        self._task: asyncio.Task | None = None
+
+    def start(self, output_level: str = "summary"):
+        """启动 SSE 监听任务"""
+        self.output_level = output_level
+        self._task = asyncio.create_task(self._listen_loop())
+
+    async def stop(self):
+        """停止 SSE 监听"""
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    def get_all_pending(self) -> dict[str, dict]:
+        """返回所有 session 的待审批请求（同步读取快照）"""
+        return dict(self.pending)
+
+    async def _listen_loop(self):
+        """主循环：SSE 监听 + 指数退避重连"""
+        backoff = 1
+        max_backoff = 60
+
+        while True:
+            try:
+                resp = await self.client.subscribe_events_raw(all_events=True)
+                backoff = 1  # 连接成功，重置退避
+
+                async for line_bytes in resp.content:
+                    line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if not line or not line.startswith("data: "):
+                        continue
+                    try:
+                        evt = json.loads(line[6:])
+                    except json.JSONDecodeError:
+                        continue
+                    await self._handle(evt)
+
+            except asyncio.CancelledError:
+                logger.info("SSE 监听已取消")
+                return
+            except Exception as e:
+                logger.warning("SSE 断线: %s, %ds 后重连", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+
+    async def _handle(self, evt: dict):
+        """处理单个 SSE 事件"""
+        etype = evt.get("type")
+        if etype != "session-updated":
+            return
+
+        sid = evt.get("sessionId", "")
+        data = evt.get("data", {})
+        agent_state = data.get("agentState")
+
+        # 更新缓存中的 session 数据
+        self._update_session_cache(sid, data)
+
+        # 从旧状态或事件数据中获取当前状态
+        async with self._lock:
+            old_state = self.session_states.get(sid, {})
+
+            is_active = data.get("active") if "active" in data else old_state.get("active", False)
+            is_thinking = data.get("thinking") if "thinking" in data else old_state.get("thinking", False)
+            old_thinking = old_state.get("thinking", False)
+            old_seq = old_state.get("lastSeq", -1)
+
+            # 如果是第一次遇到这个 session，初始化 lastSeq
+            if old_seq == -1:
+                old_seq = await self._get_latest_seq(sid)
+
+            self.session_states[sid] = {
+                "active": is_active,
+                "thinking": is_thinking,
+                "lastSeq": old_seq,
+            }
+
+        # 处理权限请求
+        if agent_state:
+            requests_data = agent_state.get("requests") or {}
+            async with self._lock:
+                old_reqs = self.pending.get(sid, {})
+                new_ids = set(requests_data.keys()) - set(old_reqs.keys())
+                if requests_data:
+                    self.pending[sid] = requests_data
+                elif sid in self.pending:
+                    del self.pending[sid]
+
+            # 有新的权限请求 -> 推送提醒
+            for rid in new_ids:
+                req = requests_data[rid]
+                tool = req.get("tool", "?")
+                label = session_label_short(sid, self.plugin.sessions_cache)
+                text = f"*** 权限请求 {label} ***\n工具: {tool}\n使用 /hapi approve 审批"
+                await self._push_notification(text, sid)
+
+        # === 输出级别处理 ===
+
+        # debug 模式：active 的 session 有事件就检查新消息
+        if self.output_level == "debug" and old_seq >= 0:
+            if is_active or is_thinking:
+                await self._show_new_messages(sid, old_seq)
+
+        # summary 模式：在 thinking 结束时显示摘要
+        elif self.output_level == "summary":
+            if old_thinking and not is_thinking:
+                await self._show_summary(sid)
+
+        # 所有模式都提醒：等待输入（在内容输出之后）
+        if is_active and old_thinking and not is_thinking:
+            pending_count = len(self.pending.get(sid, {}))
+            if pending_count == 0:
+                label = session_label_short(sid, self.plugin.sessions_cache)
+                await self._push_notification(f"⏸ 等待输入 {label}", sid)
+
+    async def _get_latest_seq(self, sid: str) -> int:
+        """获取 session 当前的最新消息序号"""
+        try:
+            messages = await session_ops.fetch_messages(self.client, sid, limit=1)
+            if messages:
+                return messages[0].get("seq", 0)
+        except Exception:
+            pass
+        return 0
+
+    def _update_session_cache(self, sid: str, updated_data: dict):
+        """实时更新缓存中的 session 数据"""
+        cache = self.plugin.sessions_cache
+        if not cache:
+            return
+
+        for s in cache:
+            if s.get("id") == sid:
+                if "active" in updated_data and updated_data["active"] is not None:
+                    s["active"] = updated_data["active"]
+                if "thinking" in updated_data and updated_data["thinking"] is not None:
+                    s["thinking"] = updated_data["thinking"]
+                if "metadata" in updated_data:
+                    s.setdefault("metadata", {}).update(updated_data["metadata"])
+                if "pendingRequestsCount" in updated_data:
+                    s["pendingRequestsCount"] = updated_data["pendingRequestsCount"]
+                break
+
+    async def _show_new_messages(self, sid: str, old_seq: int):
+        """debug 模式：获取并显示所有新消息"""
+        try:
+            messages = await session_ops.fetch_messages(self.client, sid, limit=20)
+            if not messages:
+                return
+
+            # 找出新消息（seq > old_seq），过滤掉用户消息
+            new_msgs = [
+                m for m in messages
+                if m.get("seq", 0) > old_seq
+                and m.get("content", {}).get("role") != "user"
+            ]
+
+            visible_msgs = []
+            for msg in new_msgs:
+                content = msg.get("content", {})
+                text = extract_text_preview(content, max_len=500)
+                if text is not None:
+                    visible_msgs.append((msg, text))
+
+            # 更新 lastSeq
+            latest_seq = max(m.get("seq", 0) for m in messages)
+            async with self._lock:
+                if sid in self.session_states:
+                    self.session_states[sid]["lastSeq"] = latest_seq
+
+            if not visible_msgs:
+                return
+
+            label = session_label_short(sid, self.plugin.sessions_cache)
+
+            if len(visible_msgs) == 1:
+                msg, text = visible_msgs[0]
+                seq = msg.get("seq", "?")
+                role = msg.get("content", {}).get("role", "?")
+                output = f"[DEBUG] {label}\n[{seq}] {role}: {text}"
+            else:
+                lines = [f"━━━ {label} — {len(visible_msgs)} 条新消息 ━━━"]
+                for msg, text in sorted(visible_msgs, key=lambda x: x[0].get("seq", 0)):
+                    seq = msg.get("seq", "?")
+                    role = msg.get("content", {}).get("role", "?")
+                    lines.append(f"[{seq}] {role}: {text}")
+                lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                output = "\n".join(lines)
+
+            await self._push_notification(output, sid)
+
+        except Exception as e:
+            logger.warning("debug 模式获取消息异常: %s", e)
+
+    async def _show_summary(self, sid: str):
+        """summary 模式：显示最近消息摘要"""
+        try:
+            messages = await session_ops.fetch_messages(self.client, sid, limit=5)
+            if not messages:
+                return
+
+            label = session_label_short(sid, self.plugin.sessions_cache)
+            lines = [f"━━━ {label} — 最近活动摘要 ━━━"]
+            for msg in messages:
+                seq = msg.get("seq", "?")
+                content = msg.get("content", {})
+                role = content.get("role", "?")
+                text = extract_text_preview(content)
+                if text is None:
+                    continue
+                lines.append(f"  [{seq:>4}] {role}: {text[:80]}")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+            await self._push_notification("\n".join(lines), sid)
+
+        except Exception as e:
+            logger.warning("summary 模式获取消息异常: %s", e)
+
+    async def _push_notification(self, text: str, session_id: str):
+        """向关注了该 session 的用户推送消息"""
+        for sender_id, state in self.plugin._user_states_cache.items():
+            if state.get("current_session") == session_id:
+                umo = state.get("notify_umo")
+                if umo:
+                    try:
+                        chain = MessageChain().message(text)
+                        await self.plugin.context.send_message(umo, chain)
+                    except Exception as e:
+                        logger.warning("推送消息失败 (user=%s): %s", sender_id, e)

@@ -1,24 +1,772 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+"""HAPI Connector AstrBot 插件入口
+注册指令组、快捷前缀、SSE 生命周期管理
+所有指令仅管理员可用
+"""
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.star import Context, Star, register
+from astrbot.api import AstrBotConfig, logger
+
+from astrbot.core.utils.session_waiter import session_waiter, SessionController
+
+from .hapi_client import AsyncHapiClient
+from .sse_listener import SSEListener
+from .constants import PERMISSION_MODES, MODEL_MODES, AGENTS
+from . import session_ops
+from . import formatters
+
+
+@register("astrbot_plugin_hapi_connector", "LiJinHao999",
+          "连接 HAPI，随时随地用 Claude Code / Codex / Gemini / OpenCode vibe coding",
+          "1.1.0")
+class HapiConnectorPlugin(Star):
+
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.config = config
+
+        # HAPI 客户端
+        endpoint = self.config.get("hapi_endpoint", "")
+        token = self.config.get("access_token", "")
+        proxy = self.config.get("proxy_url", "") or None
+        jwt_life = self.config.get("jwt_lifetime", 900)
+        refresh_before = self.config.get("refresh_before_expiry", 180)
+
+        self.client = AsyncHapiClient(
+            endpoint=endpoint,
+            access_token=token,
+            proxy_url=proxy,
+            jwt_lifetime=jwt_life,
+            refresh_before=refresh_before,
+        )
+
+        # SSE 监听器
+        self.sse_listener = SSEListener(self.client, self)
+
+        # session 缓存
+        self.sessions_cache: list[dict] = []
+
+        # 用户状态缓存: {sender_id: {"current_session": ..., "current_flavor": ..., "notify_umo": ...}}
+        self._user_states_cache: dict[str, dict] = {}
+
+        # 快捷前缀
+        self._quick_prefix = self.config.get("quick_prefix", ">")
+
+        # 戳一戳审批开关
+        self._poke_approve = self.config.get("poke_approve", False)
+
+    # ──── 生命周期 ────
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        """插件初始化：打开 client、加载用户状态、启动 SSE"""
+        await self.client.init()
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        # 从 KV 加载已知用户列表
+        known_users = await self.get_kv_data("known_users", [])
+        for uid in known_users:
+            state = await self.get_kv_data(f"user_state_{uid}", None)
+            if state:
+                self._user_states_cache[uid] = state
+
+        # 加载 session 缓存
+        try:
+            self.sessions_cache = await session_ops.fetch_sessions(self.client)
+        except Exception as e:
+            logger.warning("初始化加载 session 列表失败: %s", e)
+
+        # 启动 SSE
+        output_level = self.config.get("output_level", "silence")
+        self.sse_listener.start(output_level)
+        logger.info("HAPI Connector 已初始化，SSE 输出级别: %s", output_level)
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        """插件销毁：停止 SSE、关闭 client"""
+        await self.sse_listener.stop()
+        await self.client.close()
+        logger.info("HAPI Connector 已销毁")
+
+    # ──── 用户状态辅助 ────
+
+    def _get_user_state(self, event: AstrMessageEvent) -> dict:
+        sender_id = event.get_sender_id()
+        return self._user_states_cache.get(sender_id, {})
+
+    async def _set_user_state(self, event: AstrMessageEvent, **kwargs):
+        sender_id = event.get_sender_id()
+        state = self._user_states_cache.get(sender_id, {})
+        state.update(kwargs)
+        # 始终更新 notify_umo
+        state["notify_umo"] = event.unified_msg_origin
+        self._user_states_cache[sender_id] = state
+
+        # 持久化
+        await self.put_kv_data(f"user_state_{sender_id}", state)
+        # 维护 known_users 列表
+        known = await self.get_kv_data("known_users", [])
+        if sender_id not in known:
+            known.append(sender_id)
+            await self.put_kv_data("known_users", known)
+
+    def _current_sid(self, event: AstrMessageEvent) -> str | None:
+        return self._get_user_state(event).get("current_session")
+
+    def _current_flavor(self, event: AstrMessageEvent) -> str | None:
+        return self._get_user_state(event).get("current_flavor")
+
+    async def _refresh_sessions(self):
+        """刷新 session 缓存"""
+        try:
+            self.sessions_cache = await session_ops.fetch_sessions(self.client)
+        except Exception as e:
+            logger.warning("刷新 session 列表失败: %s", e)
+
+    # ──── 审批快捷操作（内部复用） ────
+
+    async def _approve_all_pending(self) -> str | None:
+        """批准所有待审批请求，返回结果文本。无待审批时返回 None。"""
+        all_pending = self.sse_listener.get_all_pending()
+        if not all_pending:
+            return None
+
+        items = []
+        for sid, reqs in all_pending.items():
+            for rid, req in reqs.items():
+                items.append((sid, rid, req))
+
+        results = []
+        for sid, rid, req in items:
+            ok, msg = await session_ops.approve_permission(self.client, sid, rid)
+            tool = req.get("tool", "?")
+            results.append(f"{'✓' if ok else '✗'} {tool}")
+
+        return f"已全部批准 ({len(items)} 个):\n" + "\n".join(results)
+
+    # ──── 指令组 ────
+
+    @filter.command_group("hapi")
+    def hapi(self):
+        """HAPI 远程 AI 编码会话管理 (仅管理员)"""
+        pass
+
+    # ── help ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("help")
+    async def cmd_help(self, event: AstrMessageEvent):
+        """显示帮助信息"""
+        yield event.plain_result(formatters.get_help_text())
+
+    # ── list ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("list", alias={"ls"})
+    async def cmd_list(self, event: AstrMessageEvent):
+        """列出所有 session"""
+        await self._refresh_sessions()
+        current_sid = self._current_sid(event)
+        text = formatters.format_session_list(self.sessions_cache, current_sid)
+        yield event.plain_result(text)
+
+    # ── sw ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("sw")
+    async def cmd_sw(self, event: AstrMessageEvent, index: int = 0):
+        """切换当前 session: /hapi sw <序号>"""
+        if index <= 0:
+            await self._refresh_sessions()
+            current_sid = self._current_sid(event)
+            text = formatters.format_session_list(self.sessions_cache, current_sid)
+            yield event.plain_result(text + "\n\n请使用 /hapi sw <序号> 切换")
+            return
+
+        await self._refresh_sessions()
+        if index > len(self.sessions_cache):
+            yield event.plain_result(f"无效序号，共 {len(self.sessions_cache)} 个 session")
+            return
+
+        chosen = self.sessions_cache[index - 1]
+        sid = chosen["id"]
+        flavor = chosen.get("metadata", {}).get("flavor", "claude")
+        await self._set_user_state(event, current_session=sid, current_flavor=flavor)
+        summary = chosen.get("metadata", {}).get("summary", {}).get("text", "(无标题)")
+        yield event.plain_result(f"已切换到 [{flavor}] {sid[:8]}... {summary}")
+
+    # ── s (status) ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("s", alias={"status"})
+    async def cmd_status(self, event: AstrMessageEvent):
+        """查看当前 session 状态"""
+        sid = self._current_sid(event)
+        if not sid:
+            yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
+            return
+        try:
+            detail = await session_ops.fetch_session_detail(self.client, sid)
+            text = formatters.format_session_status(detail)
+            yield event.plain_result(text)
+        except Exception as e:
+            yield event.plain_result(f"获取状态失败: {e}")
+
+    # ── msg ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("msg", alias={"messages"})
+    async def cmd_msg(self, event: AstrMessageEvent, limit: int = 10):
+        """查看最近消息: /hapi msg [数量]"""
+        sid = self._current_sid(event)
+        if not sid:
+            yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
+            return
+        try:
+            messages = await session_ops.fetch_messages(self.client, sid, limit=limit)
+            text = formatters.format_messages(messages)
+            yield event.plain_result(text)
+        except Exception as e:
+            yield event.plain_result(f"获取消息失败: {e}")
+
+    # ── to ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("to")
+    async def cmd_to(self, event: AstrMessageEvent):
+        """发消息到指定 session: /hapi to <序号> <内容>"""
+        raw = event.message_str.strip()
+        parts = raw.split(None, 1)
+        if len(parts) < 2 or not parts[0].isdigit():
+            yield event.plain_result("格式: /hapi to <序号> <内容>")
+            return
+
+        idx = int(parts[0])
+        text = parts[1]
+
+        await self._refresh_sessions()
+        if idx < 1 or idx > len(self.sessions_cache):
+            yield event.plain_result(f"无效序号，共 {len(self.sessions_cache)} 个 session")
+            return
+
+        target = self.sessions_cache[idx - 1]
+        ok, msg = await session_ops.send_message(self.client, target["id"], text)
+        await self._set_user_state(event)
+        yield event.plain_result(msg)
+
+    # ── perm ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("perm")
+    async def cmd_perm(self, event: AstrMessageEvent):
+        """查看/切换权限模式: /hapi perm [模式名]"""
+        sid = self._current_sid(event)
+        if not sid:
+            yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
+            return
+
+        flavor = self._current_flavor(event) or "claude"
+        modes = PERMISSION_MODES.get(flavor, ["default"])
+
+        raw = event.message_str.strip()
+        if raw:
+            mode = raw
+            if raw.isdigit() and 1 <= int(raw) <= len(modes):
+                mode = modes[int(raw) - 1]
+            if mode not in modes:
+                yield event.plain_result(f"无效模式，可用: {', '.join(modes)}")
+                return
+            ok, msg = await session_ops.set_permission_mode(self.client, sid, mode)
+            yield event.plain_result(msg)
+        else:
+            detail = await session_ops.fetch_session_detail(self.client, sid)
+            current = detail.get("permissionMode", "default")
+            text = formatters.format_permission_modes(modes, current)
+            yield event.plain_result(f"({flavor} 模式)\n{text}")
+
+    # ── model ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("model")
+    async def cmd_model(self, event: AstrMessageEvent):
+        """查看/切换模型: /hapi model [模式名]"""
+        sid = self._current_sid(event)
+        if not sid:
+            yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
+            return
+
+        flavor = self._current_flavor(event) or "claude"
+        if flavor != "claude":
+            yield event.plain_result("模型切换仅支持 Claude session")
+            return
+
+        raw = event.message_str.strip()
+        if raw:
+            mode = raw
+            if raw.isdigit() and 1 <= int(raw) <= len(MODEL_MODES):
+                mode = MODEL_MODES[int(raw) - 1]
+            if mode not in MODEL_MODES:
+                yield event.plain_result(f"无效模式，可用: {', '.join(MODEL_MODES)}")
+                return
+            ok, msg = await session_ops.set_model_mode(self.client, sid, mode)
+            yield event.plain_result(msg)
+        else:
+            detail = await session_ops.fetch_session_detail(self.client, sid)
+            current = detail.get("modelMode", "default")
+            text = formatters.format_model_modes(MODEL_MODES, current)
+            yield event.plain_result(text)
+
+    # ── approve (直接全部批准，无需多轮交互) ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("approve", alias={"a"})
+    async def cmd_approve(self, event: AstrMessageEvent):
+        """全部批准待审批请求: /hapi a"""
+        result = await self._approve_all_pending()
+        if result is None:
+            yield event.plain_result("没有待审批的请求")
+        else:
+            yield event.plain_result(result)
+
+    # ── deny (直接全部拒绝) ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("deny")
+    async def cmd_deny(self, event: AstrMessageEvent):
+        """全部拒绝待审批请求: /hapi deny"""
+        all_pending = self.sse_listener.get_all_pending()
+        if not all_pending:
+            yield event.plain_result("没有待审批的请求")
+            return
+
+        items = []
+        for sid, reqs in all_pending.items():
+            for rid, req in reqs.items():
+                items.append((sid, rid, req))
+
+        results = []
+        for sid, rid, req in items:
+            ok, msg = await session_ops.deny_permission(self.client, sid, rid)
+            tool = req.get("tool", "?")
+            results.append(f"{'✓' if ok else '✗'} {tool}")
+
+        yield event.plain_result(f"已全部拒绝 ({len(items)} 个):\n" + "\n".join(results))
+
+    # ── create ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("create")
+    async def cmd_create(self, event: AstrMessageEvent):
+        """创建新 session (5 步向导)"""
+        try:
+            machines = await session_ops.fetch_machines(self.client)
+        except Exception as e:
+            yield event.plain_result(f"获取机器列表失败: {e}")
+            return
+
+        if not machines:
+            yield event.plain_result("没有在线的机器")
+            return
+
+        labels = []
+        for m in machines:
+            meta = m.get("metadata", {})
+            host = meta.get("host", "unknown")
+            plat = meta.get("platform", "?")
+            labels.append(f"{host} ({plat})")
+
+        wizard = {
+            "step": 1,
+            "machines": machines,
+            "labels": labels,
+            "machine_id": None,
+            "machine_label": None,
+            "directory": None,
+            "session_type": "simple",
+            "worktree_name": "",
+            "agent": None,
+            "yolo": False,
+            "recent_paths": [],
+        }
+
+        if len(machines) == 1:
+            wizard["machine_id"] = machines[0]["id"]
+            wizard["machine_label"] = labels[0]
+            wizard["step"] = 2
+
+        if wizard["step"] == 1:
+            lines = ["步骤 1/5 — 选择机器:"]
+            for i, label in enumerate(labels, 1):
+                lines.append(f"  [{i}] {label}")
+            lines.append("\n回复序号选择")
+            yield event.plain_result("\n".join(lines))
+        else:
+            try:
+                wizard["recent_paths"] = await session_ops.fetch_recent_paths(self.client)
+            except Exception:
+                pass
+
+            lines = [f"自动选择机器: {wizard['machine_label']}", "", "步骤 2/5 — 工作目录:"]
+            if wizard["recent_paths"]:
+                lines.append("最近使用的目录:")
+                for i, p in enumerate(wizard["recent_paths"], 1):
+                    lines.append(f"  [{i}] {p}")
+                lines.append("回复序号选择，或直接输入新路径")
+            else:
+                lines.append("请输入完整路径")
+            yield event.plain_result("\n".join(lines))
+
+        @session_waiter(timeout=120, record_history_chains=False)
+        async def create_waiter(controller: SessionController, ev: AstrMessageEvent):
+            raw = ev.message_str.strip()
+            step = wizard["step"]
+
+            if step == 1:
+                if not raw.isdigit() or not (1 <= int(raw) <= len(wizard["machines"])):
+                    await ev.send(ev.plain_result(f"请输入 1~{len(wizard['machines'])} 的数字"))
+                    controller.keep(timeout=120, reset_timeout=True)
+                    return
+
+                idx = int(raw) - 1
+                wizard["machine_id"] = wizard["machines"][idx]["id"]
+                wizard["machine_label"] = wizard["labels"][idx]
+                wizard["step"] = 2
+
+                try:
+                    wizard["recent_paths"] = await session_ops.fetch_recent_paths(self.client)
+                except Exception:
+                    pass
+
+                lines = [f"已选机器: {wizard['machine_label']}", "", "步骤 2/5 — 工作目录:"]
+                if wizard["recent_paths"]:
+                    lines.append("最近使用的目录:")
+                    for i, p in enumerate(wizard["recent_paths"], 1):
+                        lines.append(f"  [{i}] {p}")
+                    lines.append("回复序号选择，或直接输入新路径")
+                else:
+                    lines.append("请输入完整路径")
+                await ev.send(ev.plain_result("\n".join(lines)))
+                controller.keep(timeout=120, reset_timeout=True)
+
+            elif step == 2:
+                recent = wizard["recent_paths"]
+                if raw.isdigit() and recent and 1 <= int(raw) <= len(recent):
+                    wizard["directory"] = recent[int(raw) - 1]
+                elif raw:
+                    wizard["directory"] = raw
+                else:
+                    await ev.send(ev.plain_result("目录不能为空，请重新输入"))
+                    controller.keep(timeout=120, reset_timeout=True)
+                    return
+
+                wizard["step"] = 3
+                lines = [
+                    f"目录: {wizard['directory']}",
+                    "",
+                    "步骤 3/5 — 会话类型:",
+                    "  [1] simple  — 直接使用选定目录",
+                    "  [2] worktree — 在仓库旁创建新工作树",
+                ]
+                await ev.send(ev.plain_result("\n".join(lines)))
+                controller.keep(timeout=120, reset_timeout=True)
+
+            elif step == 3:
+                if raw == "1":
+                    wizard["session_type"] = "simple"
+                elif raw == "2":
+                    wizard["session_type"] = "worktree"
+                else:
+                    await ev.send(ev.plain_result("请输入 1 或 2"))
+                    controller.keep(timeout=120, reset_timeout=True)
+                    return
+
+                if wizard["session_type"] == "worktree":
+                    wizard["step"] = 31
+                    await ev.send(ev.plain_result("工作树名称 (回复任意名称，或输入 - 自动生成):"))
+                    controller.keep(timeout=120, reset_timeout=True)
+                else:
+                    wizard["step"] = 4
+                    lines = [
+                        f"类型: {wizard['session_type']}",
+                        "",
+                        "步骤 4/5 — 选择 Vibe Coding 代理:",
+                    ]
+                    for i, a in enumerate(AGENTS, 1):
+                        lines.append(f"  [{i}] {a}")
+                    await ev.send(ev.plain_result("\n".join(lines)))
+                    controller.keep(timeout=120, reset_timeout=True)
+
+            elif step == 31:
+                if raw != "-":
+                    wizard["worktree_name"] = raw
+                wizard["step"] = 4
+                lines = [
+                    f"类型: {wizard['session_type']}"
+                    + (f" (工作树: {wizard['worktree_name']})" if wizard["worktree_name"] else ""),
+                    "",
+                    "步骤 4/5 — 选择 Vibe Coding 代理:",
+                ]
+                for i, a in enumerate(AGENTS, 1):
+                    lines.append(f"  [{i}] {a}")
+                await ev.send(ev.plain_result("\n".join(lines)))
+                controller.keep(timeout=120, reset_timeout=True)
+
+            elif step == 4:
+                if raw.isdigit() and 1 <= int(raw) <= len(AGENTS):
+                    wizard["agent"] = AGENTS[int(raw) - 1]
+                elif raw in AGENTS:
+                    wizard["agent"] = raw
+                else:
+                    await ev.send(ev.plain_result(f"请输入 1~{len(AGENTS)} 的数字或代理名"))
+                    controller.keep(timeout=120, reset_timeout=True)
+                    return
+
+                wizard["step"] = 5
+                lines = [
+                    f"代理: {wizard['agent']}",
+                    "",
+                    "步骤 5/5 — 启用 YOLO 模式?",
+                    "  [1] 否 — 正常审批流程",
+                    "  [2] 是 — 跳过审批和沙箱 (危险)",
+                ]
+                await ev.send(ev.plain_result("\n".join(lines)))
+                controller.keep(timeout=120, reset_timeout=True)
+
+            elif step == 5:
+                if raw == "1":
+                    wizard["yolo"] = False
+                elif raw == "2":
+                    wizard["yolo"] = True
+                else:
+                    await ev.send(ev.plain_result("请输入 1 或 2"))
+                    controller.keep(timeout=120, reset_timeout=True)
+                    return
+
+                wizard["step"] = 6
+                lines = [
+                    "即将创建 Session:",
+                    f"  机器:     {wizard['machine_label']}",
+                    f"  目录:     {wizard['directory']}",
+                    f"  类型:     {wizard['session_type']}",
+                    f"  代理:     {wizard['agent']}",
+                    f"  YOLO:     {'是' if wizard['yolo'] else '否'}",
+                ]
+                if wizard["worktree_name"]:
+                    lines.append(f"  工作树名: {wizard['worktree_name']}")
+                lines.append("\n回复 y 确认创建，其他取消")
+                await ev.send(ev.plain_result("\n".join(lines)))
+                controller.keep(timeout=60, reset_timeout=True)
+
+            elif step == 6:
+                if raw.lower() != "y":
+                    await ev.send(ev.plain_result("已取消"))
+                    controller.stop()
+                    return
+
+                await ev.send(ev.plain_result("正在创建 ..."))
+
+                ok, msg = await session_ops.spawn_session(
+                    self.client,
+                    machine_id=wizard["machine_id"],
+                    directory=wizard["directory"],
+                    agent=wizard["agent"],
+                    session_type=wizard["session_type"],
+                    yolo=wizard["yolo"],
+                    worktree_name=wizard["worktree_name"],
+                )
+                await ev.send(ev.plain_result(msg))
+                await self._refresh_sessions()
+                controller.stop()
+
+        try:
+            await create_waiter(event)
+        except TimeoutError:
+            yield event.plain_result("创建向导超时，已取消")
+        finally:
+            event.stop_event()
+
+    # ── archive ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("archive")
+    async def cmd_archive(self, event: AstrMessageEvent):
+        """归档当前 session"""
+        sid = self._current_sid(event)
+        if not sid:
+            yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
+            return
+
+        yield event.plain_result(f"确认归档 session [{sid[:8]}]?\n回复 y 确认")
+
+        @session_waiter(timeout=30, record_history_chains=False)
+        async def archive_waiter(controller: SessionController, ev: AstrMessageEvent):
+            if ev.message_str.strip().lower() == "y":
+                ok, msg = await session_ops.archive_session(self.client, sid)
+                await ev.send(ev.plain_result(msg))
+                if ok:
+                    await self._refresh_sessions()
+            else:
+                await ev.send(ev.plain_result("已取消"))
+            controller.stop()
+
+        try:
+            await archive_waiter(event)
+        except TimeoutError:
+            yield event.plain_result("操作超时，已取消")
+        finally:
+            event.stop_event()
+
+    # ── rename ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("rename")
+    async def cmd_rename(self, event: AstrMessageEvent):
+        """重命名当前 session"""
+        sid = self._current_sid(event)
+        if not sid:
+            yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
+            return
+
+        yield event.plain_result(f"请输入 session [{sid[:8]}] 的新名称:")
+
+        @session_waiter(timeout=60, record_history_chains=False)
+        async def rename_waiter(controller: SessionController, ev: AstrMessageEvent):
+            new_name = ev.message_str.strip()
+            if not new_name:
+                await ev.send(ev.plain_result("名称不能为空，已取消"))
+            else:
+                ok, msg = await session_ops.rename_session(self.client, sid, new_name)
+                await ev.send(ev.plain_result(msg))
+                if ok:
+                    await self._refresh_sessions()
+            controller.stop()
+
+        try:
+            await rename_waiter(event)
+        except TimeoutError:
+            yield event.plain_result("操作超时，已取消")
+        finally:
+            event.stop_event()
+
+    # ── delete ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("delete")
+    async def cmd_delete(self, event: AstrMessageEvent):
+        """删除当前 session"""
+        sid = self._current_sid(event)
+        if not sid:
+            yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
+            return
+
+        yield event.plain_result(f"即将删除 session [{sid[:8]}]\n输入 delete 确认删除:")
+
+        @session_waiter(timeout=30, record_history_chains=False)
+        async def delete_waiter(controller: SessionController, ev: AstrMessageEvent):
+            if ev.message_str.strip() == "delete":
+                ok, msg = await session_ops.delete_session(self.client, sid)
+                await ev.send(ev.plain_result(msg))
+                if ok:
+                    await self._set_user_state(ev, current_session=None, current_flavor=None)
+                    await self._refresh_sessions()
+            else:
+                await ev.send(ev.plain_result("已取消"))
+            controller.stop()
+
+        try:
+            await delete_waiter(event)
+        except TimeoutError:
+            yield event.plain_result("操作超时，已取消")
+        finally:
+            event.stop_event()
+
+    # ──── 戳一戳全部审批 (仅 QQ NapCat) ────
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=20)
+    async def poke_approve_handler(self, event: AstrMessageEvent):
+        """戳一戳机器人 → 自动批准所有待审批请求 (仅 QQ NapCat)
+
+        NapCat 通过 OneBotv11 协议发送戳一戳 notice 事件。
+        需要 AstrBot 的 aiocqhttp 适配器将 notice 事件转发为 AstrMessageEvent。
+        若未生效，请确认适配器版本支持 notice 事件。
+        """
+        if not self._poke_approve:
+            return
+
+        if not self._is_poke_event(event):
+            return
+
+        result = await self._approve_all_pending()
+        if result is None:
+            return  # 无待审批，静默
+        yield event.plain_result(f"[戳一戳审批] {result}")
+        event.stop_event()
+
+    def _is_poke_event(self, event: AstrMessageEvent) -> bool:
+        """检测是否为 NapCat 戳一戳事件"""
+        try:
+            raw = getattr(event, 'message_obj', None)
+            if raw is None:
+                return False
+
+            # OneBotv11 notice 事件: {"post_type": "notice", "sub_type": "poke", ...}
+            if isinstance(raw, dict):
+                return (raw.get('post_type') == 'notice'
+                        and raw.get('sub_type') == 'poke')
+
+            # 对象形式访问
+            if (getattr(raw, 'post_type', None) == 'notice'
+                    and getattr(raw, 'sub_type', None) == 'poke'):
+                return True
+
+            return False
+        except Exception:
+            return False
+
+    # ──── 快捷前缀处理器 ────
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
+    async def quick_prefix_handler(self, event: AstrMessageEvent):
+        """快捷前缀: > 消息 或 >N 消息 (仅管理员)"""
+        prefix = self._quick_prefix
+        raw = event.message_str
+
+        if not raw or not raw.startswith(prefix):
+            return  # 不匹配，不拦截
+
+        rest = raw[len(prefix):]
+
+        if not rest:
+            return  # 只有前缀，忽略
+
+        target_sid = None
+        text = None
+
+        parts = rest.split(None, 1)
+        if parts[0].isdigit():
+            idx = int(parts[0])
+            if len(parts) < 2:
+                return  # >N 但没有消息内容
+            text = parts[1]
+
+            await self._refresh_sessions()
+            if 1 <= idx <= len(self.sessions_cache):
+                target_sid = self.sessions_cache[idx - 1]["id"]
+            else:
+                yield event.plain_result(f"无效序号 {idx}，共 {len(self.sessions_cache)} 个 session")
+                event.stop_event()
+                return
+        else:
+            text = rest.lstrip()
+            if not text:
+                return
+            target_sid = self._current_sid(event)
+
+        if not target_sid:
+            yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
+            event.stop_event()
+            return
+
+        ok, msg = await session_ops.send_message(self.client, target_sid, text)
+        await self._set_user_state(event)
+        yield event.plain_result(msg)
+        event.stop_event()
