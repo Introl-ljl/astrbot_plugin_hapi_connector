@@ -6,7 +6,10 @@ import json
 def extract_text_preview(content: dict, max_len: int = 80) -> str | None:
     """从消息 content 中提取文本预览。
     返回 None 表示该消息不应显示（如 token_count、ready 事件）。
+    max_len <= 0 表示不截断。
     """
+    if max_len <= 0:
+        max_len = 999999
     inner = content.get("content", {})
 
     if isinstance(inner, str):
@@ -266,7 +269,7 @@ def get_help_text() -> str:
   /hapi msg [数量] 查看最近消息 (默认 10)
   /hapi perm [模式] 查看/切换权限模式
   /hapi model [模式] 查看/切换模型 (仅 Claude)
-  /hapi output [级别] 查看/切换 SSE 推送级别
+  /hapi output [级别] 查看/切换 SSE 推送级别 (silence/simple/debug)
 
 ── Session 管理 ──
   /hapi list       列出所有 session

@@ -16,7 +16,7 @@ AstrBot 插件 —— 通过聊天指令管理远程 AI 编码会话。
 - 归档、重命名、删除会话
 - 后台 SSE 实时推送 AI 输出和权限请求到聊天窗口，推送级别可调：
   - **silence**（默认）— 仅推送权限请求和等待输入提醒
-  - **summary** — AI 思考完成后推送最近消息摘要
+  - **simple** — AI 思考完成后推送最近 agent 文本消息（条数可配置）
   - **debug** — 实时推送所有新消息（信息量较大）
 
 ## 安装
@@ -40,7 +40,8 @@ https://github.com/LiJinHao999/astrbot_plugin_hapi_connector
 | `proxy_url` | 代理地址，支持 `socks5h://` 和 `http://` | 空 |
 | `jwt_lifetime` | JWT 有效期（秒） | 900 |
 | `refresh_before_expiry` | JWT 提前刷新时间（秒） | 180 |
-| `output_level` | SSE 推送级别（下拉框）：`silence` / `summary` / `debug` | silence |
+| `output_level` | SSE 推送级别（下拉框）：`silence` / `simple` / `debug` | silence |
+| `simple_msg_count` | simple 推送级别显示的 agent 消息条数 | 5 |
 | `quick_prefix` | 快捷发送前缀字符 | `>` |
 | `poke_approve` | 戳一戳自动全部审批（仅 QQ NapCat 可用） | 关闭 |
 
@@ -136,7 +137,6 @@ astrbot_plugin_hapi_connector/
 
 ## TODO
 
-- [ ] Summary 模式下，AI 对交互过程的信息压缩（用 LLM 摘要替代原始消息拼接）
 - [ ] 通过 AstrBot 的自然语言触发相关指令调用，让用于聊天的 LLM 感知当前正在进行的编码任务
 - [ ] 支持多用户独立会话状态
 

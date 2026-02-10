@@ -152,10 +152,10 @@ class SSEListener:
                 if self._debounce_task is None or self._debounce_task.done():
                     self._debounce_task = asyncio.create_task(self._debounced_fetch())
 
-        # summary 模式：在 thinking 结束时显示摘要
-        elif self.output_level == "summary":
+        # simple 模式：在 thinking 结束时显示最近 agent 文本消息
+        elif self.output_level == "simple":
             if old_thinking and not is_thinking:
-                await self._show_summary(sid)
+                await self._show_simple(sid)
 
         # 所有模式都提醒：等待输入（在内容输出之后）
         if is_active and old_thinking and not is_thinking:
@@ -254,29 +254,43 @@ class SSEListener:
         except Exception as e:
             logger.warning("debug 模式获取消息异常: %s", e)
 
-    async def _show_summary(self, sid: str):
-        """summary 模式：显示最近消息摘要"""
+    async def _show_simple(self, sid: str):
+        """simple 模式：显示最近的 agent 纯文本消息（不含工具调用等）"""
         try:
-            messages = await session_ops.fetch_messages(self.client, sid, limit=5)
+            msg_count = getattr(self.plugin, '_simple_msg_count', 5)
+            # 多取一些以确保过滤后够数
+            messages = await session_ops.fetch_messages(self.client, sid, limit=50)
             if not messages:
                 return
 
-            label = session_label_short(sid, self.plugin.sessions_cache)
-            lines = [f"━━━ {label} — 最近活动摘要 ━━━"]
+            # 筛选: agent 角色、有文本内容、不以 [ 开头（排除工具调用/返回等）
+            agent_texts = []
             for msg in messages:
-                seq = msg.get("seq", "?")
                 content = msg.get("content", {})
-                role = content.get("role", "?")
-                text = extract_text_preview(content)
-                if text is None:
+                if content.get("role") != "agent":
                     continue
-                lines.append(f"  [{seq:>4}] {role}: {text[:80]}")
+                text = extract_text_preview(content, max_len=0)
+                if text is None or text.startswith("["):
+                    continue
+                agent_texts.append((msg, text))
+
+            if not agent_texts:
+                return
+
+            # 取最后 N 条
+            agent_texts = agent_texts[-msg_count:]
+
+            label = session_label_short(sid, self.plugin.sessions_cache)
+            lines = [f"━━━ {label} ━━━"]
+            for msg, text in agent_texts:
+                seq = msg.get("seq", "?")
+                lines.append(f"[{seq}] {text}")
             lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
             await self._push_notification("\n".join(lines), sid)
 
         except Exception as e:
-            logger.warning("summary 模式获取消息异常: %s", e)
+            logger.warning("simple 模式获取消息异常: %s", e)
 
     async def _push_notification(self, text: str, session_id: str):
         """向关注了该 session 的用户推送消息"""

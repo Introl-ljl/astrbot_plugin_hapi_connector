@@ -30,7 +30,12 @@
     "description": "SSE 推送级别",
     "type": "string",
     "default": "silence",
-    "options": ["silence", "summary", "debug"]
+    "options": ["silence", "simple", "debug"]
+  },
+  "simple_msg_count": {
+    "description": "simple 推送级别显示的 agent 消息条数",
+    "type": "int",
+    "default": 5
   },
   "quick_prefix": {
     "description": "快捷发送前缀",

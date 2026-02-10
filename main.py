@@ -56,6 +56,9 @@ class HapiConnectorPlugin(Star):
         # 戳一戳审批开关
         self._poke_approve = self.config.get("poke_approve", False)
 
+        # simple 模式消息条数
+        self._simple_msg_count = self.config.get("simple_msg_count", 5)
+
         # 管理员列表（用于 catch-all 处理器手动鉴权）
         astrbot_config = self.context.get_config()
         self._admin_ids = [str(x) for x in astrbot_config.get("admins_id", [])]
@@ -350,7 +353,7 @@ class HapiConnectorPlugin(Star):
 
     _OUTPUT_LEVELS = {
         "silence": "仅推送权限请求和任务完成提醒",
-        "summary": "AI 思考完成后推送最近消息摘要",
+        "simple": "AI 思考完成后推送最近 agent 文本消息",
         "debug": "实时推送所有新消息（信息量较大）",
     }
 
