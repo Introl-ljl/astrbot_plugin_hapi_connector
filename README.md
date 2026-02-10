@@ -35,7 +35,7 @@ https://github.com/LiJinHao999/astrbot_plugin_hapi_connector
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| `hapi_endpoint` | HAPI 服务地址，如 `http://10.200.11.13:3006` | |
+| `hapi_endpoint` | HAPI 服务地址，如 `http://localhost:3006` | |
 | `access_token` | HAPI Access Token，支持 `token:namespace` 格式 | |
 | `proxy_url` | 代理地址，支持 `socks5h://` 和 `http://` | 空 |
 | `jwt_lifetime` | JWT 有效期（秒） | 900 |
