@@ -122,16 +122,19 @@ class HapiConnectorPlugin(Star):
 
     # ──── 审批快捷操作（内部复用） ────
 
-    async def _approve_all_pending(self) -> str | None:
-        """批准所有待审批请求，返回结果文本。无待审批时返回 None。"""
-        all_pending = self.sse_listener.get_all_pending()
-        if not all_pending:
-            return None
-
+    def _flatten_pending(self) -> list[tuple[str, str, dict]]:
+        """将 pending 请求扁平化为 [(sid, rid, req), ...]"""
         items = []
-        for sid, reqs in all_pending.items():
+        for sid, reqs in self.sse_listener.get_all_pending().items():
             for rid, req in reqs.items():
                 items.append((sid, rid, req))
+        return items
+
+    async def _approve_all_pending(self) -> str | None:
+        """批准所有待审批请求，返回结果文本。无待审批时返回 None。"""
+        items = self._flatten_pending()
+        if not items:
+            return None
 
         results = []
         for sid, rid, req in items:
@@ -313,41 +316,79 @@ class HapiConnectorPlugin(Star):
             text = formatters.format_model_modes(MODEL_MODES, current)
             yield event.plain_result(text)
 
-    # ── approve (直接全部批准，无需多轮交互) ──
+    # ── pending (查看待审批列表) ──
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("pending")
+    async def cmd_pending(self, event: AstrMessageEvent):
+        """查看待审批请求列表: /hapi pending"""
+        all_pending = self.sse_listener.get_all_pending()
+        text = formatters.format_pending_requests(all_pending, self.sessions_cache)
+        yield event.plain_result(text)
+
+    # ── approve ──
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @hapi.command("approve", alias={"a"})
     async def cmd_approve(self, event: AstrMessageEvent):
-        """全部批准待审批请求: /hapi a"""
-        result = await self._approve_all_pending()
-        if result is None:
+        """批准审批请求: /hapi a 全部批准, /hapi a <序号> 批准单个"""
+        items = self._flatten_pending()
+        if not items:
             yield event.plain_result("没有待审批的请求")
-        else:
-            yield event.plain_result(result)
+            return
 
-    # ── deny (直接全部拒绝) ──
+        raw = event.message_str.strip()
+
+        if raw and raw.isdigit():
+            # 批准单个
+            n = int(raw)
+            if n < 1 or n > len(items):
+                yield event.plain_result(f"无效序号，当前共 {len(items)} 个待审批")
+                return
+            sid, rid, req = items[n - 1]
+            ok, msg = await session_ops.approve_permission(self.client, sid, rid)
+            tool = req.get("tool", "?")
+            yield event.plain_result(f"{'✓' if ok else '✗'} 已批准: {tool}")
+        else:
+            # 全部批准
+            results = []
+            for sid, rid, req in items:
+                ok, msg = await session_ops.approve_permission(self.client, sid, rid)
+                tool = req.get("tool", "?")
+                results.append(f"{'✓' if ok else '✗'} {tool}")
+            yield event.plain_result(f"已全部批准 ({len(items)} 个):\n" + "\n".join(results))
+
+    # ── deny ──
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @hapi.command("deny")
     async def cmd_deny(self, event: AstrMessageEvent):
-        """全部拒绝待审批请求: /hapi deny"""
-        all_pending = self.sse_listener.get_all_pending()
-        if not all_pending:
+        """拒绝审批请求: /hapi deny 全部拒绝, /hapi deny <序号> 拒绝单个"""
+        items = self._flatten_pending()
+        if not items:
             yield event.plain_result("没有待审批的请求")
             return
 
-        items = []
-        for sid, reqs in all_pending.items():
-            for rid, req in reqs.items():
-                items.append((sid, rid, req))
+        raw = event.message_str.strip()
 
-        results = []
-        for sid, rid, req in items:
+        if raw and raw.isdigit():
+            # 拒绝单个
+            n = int(raw)
+            if n < 1 or n > len(items):
+                yield event.plain_result(f"无效序号，当前共 {len(items)} 个待审批")
+                return
+            sid, rid, req = items[n - 1]
             ok, msg = await session_ops.deny_permission(self.client, sid, rid)
             tool = req.get("tool", "?")
-            results.append(f"{'✓' if ok else '✗'} {tool}")
-
-        yield event.plain_result(f"已全部拒绝 ({len(items)} 个):\n" + "\n".join(results))
+            yield event.plain_result(f"{'✓' if ok else '✗'} 已拒绝: {tool}")
+        else:
+            # 全部拒绝
+            results = []
+            for sid, rid, req in items:
+                ok, msg = await session_ops.deny_permission(self.client, sid, rid)
+                tool = req.get("tool", "?")
+                results.append(f"{'✓' if ok else '✗'} {tool}")
+            yield event.plain_result(f"已全部拒绝 ({len(items)} 个):\n" + "\n".join(results))
 
     # ── create ──
 

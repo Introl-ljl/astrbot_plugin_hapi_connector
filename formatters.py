@@ -217,7 +217,8 @@ def format_pending_requests(pending: dict[str, dict], sessions_cache: list[dict]
         lines.append(f"[{i}] {label} {tool}")
         lines.append(f"    {args}")
 
-    lines.append("\n回复: a=全部批准  d=全部拒绝  序号=批准单个  序号d=拒绝单个")
+    lines.append("\n/hapi a 全部批准 | /hapi a <序号> 批准单个")
+    lines.append("/hapi deny 全部拒绝 | /hapi deny <序号> 拒绝单个")
     return "\n".join(lines)
 
 
@@ -265,8 +266,11 @@ def get_help_text() -> str:
   >N 消息内容             快捷发送到第 N 个 session
 
 ── 审批 ──
-  /hapi a          全部批准待审批请求
-  /hapi deny       全部拒绝待审批请求
+  /hapi pending    查看待审批列表
+  /hapi a          全部批准
+  /hapi a <序号>   批准单个
+  /hapi deny       全部拒绝
+  /hapi deny <序号> 拒绝单个
   戳一戳机器人      全部批准 (仅 QQ NapCat)
 
 ── 其他 ──
