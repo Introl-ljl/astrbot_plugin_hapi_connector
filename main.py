@@ -340,6 +340,37 @@ class HapiConnectorPlugin(Star):
             text = formatters.format_model_modes(MODEL_MODES, current)
             yield event.plain_result(text)
 
+    # ── output ──
+
+    _OUTPUT_LEVELS = ["silence", "summary", "debug"]
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @hapi.command("output", alias={"out"})
+    async def cmd_output(self, event: AstrMessageEvent):
+        """查看/切换 SSE 推送级别: /hapi output [级别]"""
+        raw = event.message_str.strip()
+        current = self.sse_listener.output_level
+
+        if not raw:
+            lines = [f"当前 SSE 推送级别: {current}"]
+            for i, lvl in enumerate(self._OUTPUT_LEVELS, 1):
+                tag = " <--" if lvl == current else ""
+                lines.append(f"  [{i}] {lvl}{tag}")
+            lines.append("\n回复序号或级别名切换")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        level = raw
+        if raw.isdigit() and 1 <= int(raw) <= len(self._OUTPUT_LEVELS):
+            level = self._OUTPUT_LEVELS[int(raw) - 1]
+        if level not in self._OUTPUT_LEVELS:
+            yield event.plain_result(
+                f"无效级别，可用: {', '.join(self._OUTPUT_LEVELS)}")
+            return
+
+        self.sse_listener.output_level = level
+        yield event.plain_result(f"SSE 推送级别已切换为: {level}")
+
     # ── pending (查看待审批列表) ──
 
     @filter.permission_type(filter.PermissionType.ADMIN)

@@ -266,10 +266,11 @@ def get_help_text() -> str:
   /hapi msg [数量] 查看最近消息 (默认 10)
   /hapi perm [模式] 查看/切换权限模式
   /hapi model [模式] 查看/切换模型 (仅 Claude)
+  /hapi output [级别] 查看/切换 SSE 推送级别
 
 ── Session 管理 ──
   /hapi list       列出所有 session
-  /hapi sw <序号>  切换当前 session
+  /hapi sw <序号|ID前缀>  切换当前 session
   /hapi create     创建新 session (向导)
   /hapi archive    归档当前 session
   /hapi rename     重命名当前 session
