@@ -145,17 +145,12 @@ class SSEListener:
 
         # === 输出级别处理 ===
 
-        # debug 模式：防抖，合并短时间内的事件一次性拉取
-        if self.output_level == "debug" and old_seq >= 0:
+        # debug/simple 模式：防抖，合并短时间内的事件一次性拉取
+        if self.output_level in ("debug", "simple") and old_seq >= 0:
             if is_active or is_thinking:
                 self._debounce_sids.add(sid)
                 if self._debounce_task is None or self._debounce_task.done():
                     self._debounce_task = asyncio.create_task(self._debounced_fetch())
-
-        # simple 模式：在 thinking 结束时显示最近 agent 文本消息
-        elif self.output_level == "simple":
-            if old_thinking and not is_thinking:
-                await self._show_simple(sid)
 
         # 所有模式都提醒：等待输入（在内容输出之后）
         if is_active and old_thinking and not is_thinking:
@@ -201,7 +196,10 @@ class SSEListener:
             async with self._lock:
                 old_seq = self.session_states.get(sid, {}).get("lastSeq", -1)
             if old_seq >= 0:
-                await self._show_new_messages(sid, old_seq)
+                if self.output_level == "debug":
+                    await self._show_new_messages(sid, old_seq)
+                elif self.output_level == "simple":
+                    await self._show_simple(sid, old_seq)
 
     async def _show_new_messages(self, sid: str, old_seq: int):
         """debug 模式：获取并显示所有新消息"""
@@ -254,31 +252,31 @@ class SSEListener:
         except Exception as e:
             logger.warning("debug 模式获取消息异常: %s", e)
 
-    async def _show_simple(self, sid: str):
-        """simple 模式：显示最后一条 user 消息之后的所有 agent 纯文本消息"""
+    async def _show_simple(self, sid: str, old_seq: int):
+        """simple 模式：获取并显示新的 agent 纯文本消息"""
         try:
             messages = await session_ops.fetch_messages(self.client, sid, limit=50)
             if not messages:
                 return
 
-            # 找到最后一条 user 消息的 seq，只取其后的 agent 消息
-            last_user_seq = 0
-            for msg in messages:
-                if msg.get("content", {}).get("role") == "user":
-                    last_user_seq = max(last_user_seq, msg.get("seq", 0))
-
-            # 筛选: seq > last_user_seq、agent 角色、有文本内容、不以 [ 开头（排除工具调用/返回等）
+            # 筛选: seq > old_seq、agent 角色、有文本内容、不以 [ 开头（排除工具调用/返回等）
             agent_texts = []
             for msg in messages:
+                if msg.get("seq", 0) <= old_seq:
+                    continue
                 content = msg.get("content", {})
                 if content.get("role") != "agent":
-                    continue
-                if msg.get("seq", 0) <= last_user_seq:
                     continue
                 text = extract_text_preview(content, max_len=0)
                 if text is None or text.startswith("["):
                     continue
                 agent_texts.append((msg, text))
+
+            # 更新 lastSeq
+            latest_seq = max(m.get("seq", 0) for m in messages)
+            async with self._lock:
+                if sid in self.session_states:
+                    self.session_states[sid]["lastSeq"] = latest_seq
 
             if not agent_texts:
                 return
