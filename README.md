@@ -24,7 +24,7 @@ AstrBot 插件 —— 通过聊天指令管理远程 AI 编码会话。
 在 AstrBot 管理面板中搜索 `hapi_connector` 安装，或通过仓库地址手动安装：
 
 ```
-https://github.com/LiJinHao999/astrbot_plugin_hapi_connector
+https://github.com/Introl-ljl/astrbot_plugin_hapi_connector
 ```
 
 依赖会自动安装（`aiohttp`、`aiohttp-socks`）。

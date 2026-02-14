@@ -17,9 +17,9 @@ from . import session_ops
 from . import formatters
 
 
-@register("astrbot_plugin_hapi_connector", "LiJinHao999",
+@register("astrbot_plugin_hapi_connector", "Introl-ljl",
           "连接 HAPI，随时随地用 Claude Code / Codex / Gemini / OpenCode vibe coding",
-          "1.1.0")
+          "1.1.1")
 class HapiConnectorPlugin(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig):
