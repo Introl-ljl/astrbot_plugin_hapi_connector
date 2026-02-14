@@ -560,6 +560,12 @@ class HapiConnectorPlugin(Star):
         @session_waiter(timeout=120, record_history_chains=False)
         async def create_waiter(controller: SessionController, ev: AstrMessageEvent):
             raw = ev.message_str.strip()
+
+            # 过滤空消息，避免 napcat 空消息导致重复提示和误触取消
+            if not raw:
+                controller.keep(timeout=120, reset_timeout=True)
+                return
+
             step = wizard["step"]
 
             if step == 1:
@@ -746,7 +752,14 @@ class HapiConnectorPlugin(Star):
 
         @session_waiter(timeout=30, record_history_chains=False)
         async def archive_waiter(controller: SessionController, ev: AstrMessageEvent):
-            if ev.message_str.strip().lower() == "y":
+            raw = ev.message_str.strip()
+
+            # 过滤空消息
+            if not raw:
+                controller.keep(timeout=30, reset_timeout=True)
+                return
+
+            if raw.lower() == "y":
                 ok, msg = await session_ops.archive_session(self.client, sid)
                 await ev.send(ev.plain_result(msg))
                 if ok:
@@ -779,6 +792,8 @@ class HapiConnectorPlugin(Star):
         @session_waiter(timeout=60, record_history_chains=False)
         async def rename_waiter(controller: SessionController, ev: AstrMessageEvent):
             new_name = ev.message_str.strip()
+
+            # 空消息直接取消（rename 需要非空名称）
             if not new_name:
                 await ev.send(ev.plain_result("名称不能为空，已取消"))
             else:
@@ -810,7 +825,14 @@ class HapiConnectorPlugin(Star):
 
         @session_waiter(timeout=30, record_history_chains=False)
         async def delete_waiter(controller: SessionController, ev: AstrMessageEvent):
-            if ev.message_str.strip() == "delete":
+            raw = ev.message_str.strip()
+
+            # 过滤空消息
+            if not raw:
+                controller.keep(timeout=30, reset_timeout=True)
+                return
+
+            if raw == "delete":
                 ok, msg = await session_ops.delete_session(self.client, sid)
                 await ev.send(ev.plain_result(msg))
                 if ok:
